@@ -1,0 +1,205 @@
+rules_version = '2';
+
+// Daily Devotional — Firestore security rules.
+// See docs/DATA_MODEL.md for the schema these rules protect.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Helpers ──────────────────────────────────────────────
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // Admin rights come ONLY from server-controlled sources:
+    //  - a custom auth claim set with the Admin SDK, or
+    //  - an /admins/{uid} document (clients can never write it).
+    function isAdmin() {
+      return signedIn() && (
+        request.auth.token.admin == true ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function onlyChanged(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
+    function isDateKey(v) {
+      return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function validText(v, maxLen) {
+      return v is string && v.size() > 0 && v.size() <= maxLen;
+    }
+
+    // ─── Admins (console / Admin SDK only) ────────────────────
+    match /admins/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow write: if false;
+    }
+
+    // ─── App configuration ────────────────────────────────────
+    match /app_config/{docId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // ─── Series ───────────────────────────────────────────────
+    match /series/{seriesId} {
+      allow read: if isAdmin() || resource.data.status in ['active', 'archived'];
+      allow create, update: if isAdmin()
+        && validText(request.resource.data.title, 200)
+        && isDateKey(request.resource.data.startDate)
+        && request.resource.data.status in ['draft', 'active', 'archived'];
+      allow delete: if isAdmin();
+    }
+
+    // ─── Devotionals ──────────────────────────────────────────
+    function validDevotional(d) {
+      return validText(d.title, 300)
+        && d.status in ['draft', 'published', 'archived']
+        && d.published == (d.status == 'published')
+        && d.dayNumber is int && d.dayNumber >= 1
+        && isDateKey(d.date)
+        && d.scriptureReference is string
+        && d.body is string
+        && d.tags is list;
+    }
+
+    match /devotionals/{devotionalId} {
+      // Unpublished (draft / archived) content is never publicly readable.
+      allow read: if isAdmin() || resource.data.status == 'published';
+      allow create, update: if isAdmin() && validDevotional(request.resource.data);
+      allow delete: if isAdmin();
+
+      function devotionalPublished() {
+        return get(/databases/$(database)/documents/devotionals/$(devotionalId)).data.status == 'published';
+      }
+
+      // ── Community reflections ──
+      match /comments/{commentId} {
+        function validReactionKey(k) {
+          let before = resource.data.reactions[k].toSet();
+          let after = request.resource.data.reactions[k].toSet();
+          return request.resource.data.reactions[k] is list
+            && request.resource.data.reactions[k].size() == after.size()   // no duplicates
+            && after.difference(before).hasOnly([request.auth.uid])
+            && before.difference(after).hasOnly([request.auth.uid]);
+        }
+
+        function validReactionChange() {
+          return request.resource.data.reactions.keys().hasOnly(['amen', 'heart', 'fire'])
+            && validReactionKey('amen')
+            && validReactionKey('heart')
+            && validReactionKey('fire');
+        }
+
+        allow read: if signedIn() && (
+          resource.data.status == 'visible' ||
+          resource.data.authorId == request.auth.uid ||
+          isAdmin()
+        );
+
+        allow create: if signedIn()
+          && request.resource.data.keys().hasOnly([
+               'devotionalId', 'authorId', 'authorName', 'authorPhoto', 'parentId',
+               'content', 'reactions', 'status', 'edited', 'createdAt', 'updatedAt'])
+          && request.resource.data.authorId == request.auth.uid
+          && request.resource.data.devotionalId == devotionalId
+          && validText(request.resource.data.authorName, 80)
+          && validText(request.resource.data.content, 1000)
+          && request.resource.data.status == 'visible'
+          && request.resource.data.edited == false
+          && request.resource.data.reactions == { 'amen': [], 'heart': [], 'fire': [] }
+          && request.resource.data.createdAt == request.time
+          && (request.resource.data.parentId == null ||
+              exists(/databases/$(database)/documents/devotionals/$(devotionalId)/comments/$(request.resource.data.parentId)))
+          && devotionalPublished();
+
+        allow update: if
+          // Author edits their own text.
+          (isOwner(resource.data.authorId)
+            && onlyChanged(['content', 'edited', 'updatedAt'])
+            && validText(request.resource.data.content, 1000)
+            && request.resource.data.edited == true)
+          // Any member toggles ONLY their own reaction.
+          || (signedIn() && onlyChanged(['reactions']) && validReactionChange())
+          // Moderation.
+          || (isAdmin() && onlyChanged(['status', 'updatedAt'])
+              && request.resource.data.status in ['visible', 'hidden']);
+
+        allow delete: if isOwner(resource.data.authorId) || isAdmin();
+      }
+
+      // ── Church-wide completion activity (no personal content) ──
+      match /completions/{uid} {
+        allow read: if signedIn();
+        allow create: if isOwner(uid)
+          && request.resource.data.keys().hasOnly(['uid', 'completedAt'])
+          && request.resource.data.uid == uid
+          && request.resource.data.completedAt == request.time;
+        allow update: if false;
+        allow delete: if isOwner(uid) || isAdmin();
+      }
+    }
+
+    // Admin moderation uses collection-group queries over all comments.
+    match /{path=**}/comments/{commentId} {
+      allow read: if isAdmin();
+    }
+
+    // ─── Reports ──────────────────────────────────────────────
+    match /reports/{reportId} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['commentId', 'devotionalId', 'reporterId', 'reason', 'status', 'createdAt'])
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.status == 'open'
+        && request.resource.data.commentId is string
+        && request.resource.data.devotionalId is string
+        && request.resource.data.reason is string && request.resource.data.reason.size() <= 500
+        && request.resource.data.createdAt == request.time;
+      allow read, update, delete: if isAdmin();
+    }
+
+    // ─── Announcements (admin only) ───────────────────────────
+    match /announcements/{id} {
+      allow read, write: if isAdmin();
+    }
+
+    // ─── Users ────────────────────────────────────────────────
+    function validProfile(d) {
+      // No role / admin fields can ever be written by clients.
+      return d.keys().hasOnly([
+          'displayName', 'email', 'photoURL', 'timezone', 'createdAt', 'updatedAt',
+          'progress', 'notificationPrefs',
+          // legacy MVP fields kept so existing docs remain updatable
+          'streak', 'lastReadDate', 'isGuest', 'churchAffiliation'])
+        && (!('displayName' in d) || (d.displayName is string && d.displayName.size() <= 80));
+    }
+
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create, update: if isOwner(uid) && validProfile(request.resource.data);
+      allow delete: if false;
+
+      match /completions/{dateKey} {
+        allow read: if isOwner(uid) || isAdmin();
+        allow create, update: if isOwner(uid)
+          && isDateKey(dateKey)
+          && request.resource.data.date == dateKey;
+        allow delete: if isOwner(uid);
+      }
+
+      match /{sub}/{docId} {
+        allow read, write: if isOwner(uid)
+          && sub in ['notes', 'highlights', 'bookmarks', 'devices'];
+      }
+    }
+
+    // Everything else is denied by default.
+  }
+}
